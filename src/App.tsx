@@ -313,35 +313,54 @@ export const storageHelper = {
 };
 
 export default function App() {
+  const [user, setUser] = useState<FirebaseUser | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, (u) => {
+      setUser(u);
+      setAuthLoading(false);
+    });
+    return unsub;
+  }, []);
+
   // Navigation State
   const [activeTab, setActiveTab] = useState<'dashboard' | 'inventory' | 'saved_money' | 'database'>('dashboard');
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
 
-  // Persistence State: Memuat data dari LocalStorage secara instan & aman
-  const [products, setProducts] = useState<Product[]>(() =>
-    storageHelper.get<Product[]>(STORAGE_KEYS.INVENTORY, INITIAL_PRODUCTS, 'mbti_canteen_products')
-  );
-
-  const [students, setStudents] = useState<Student[]>(() =>
-    storageHelper.get<Student[]>(STORAGE_KEYS.STUDENTS, INITIAL_STUDENTS, 'mbti_canteen_students')
-  );
-
-  const [transactions, setTransactions] = useState<Transaction[]>(() =>
-    storageHelper.get<Transaction[]>(STORAGE_KEYS.TRANSACTIONS, INITIAL_TRANSACTIONS, 'mbti_canteen_transactions')
-  );
-
-  // 3. Sinkronisasi Real-Time: Menyimpan setiap perubahan state langsung ke LocalStorage
-  useEffect(() => {
-    storageHelper.set(STORAGE_KEYS.INVENTORY, products);
-  }, [products]);
+  const [products, setProducts] = useState<Product[]>([]);
+  const [students, setStudents] = useState<Student[]>([]);
+  const [transactions, setTransactions] = useState<Transaction[]>([]);
+  const [dbReady, setDbReady] = useState(false);
 
   useEffect(() => {
-    storageHelper.set(STORAGE_KEYS.STUDENTS, students);
-  }, [students]);
+    let unsubProducts: (() => void) | undefined;
+    let unsubStudents: (() => void) | undefined;
+    let unsubTransactions: (() => void) | undefined;
 
-  useEffect(() => {
-    storageHelper.set(STORAGE_KEYS.TRANSACTIONS, transactions);
-  }, [transactions]);
+    migrateLocalStorageToFirestore().then(() => {
+      const qProducts = query(collection(db, 'products'));
+      const qStudents = query(collection(db, 'students'));
+      const qTransactions = query(collection(db, 'transactions'), orderBy('date', 'desc'));
+
+      unsubProducts = onSnapshot(qProducts, (snap) => {
+        setProducts(snap.docs.map((d) => d.data() as Product));
+      });
+      unsubStudents = onSnapshot(qStudents, (snap) => {
+        setStudents(snap.docs.map((d) => d.data() as Student));
+      });
+      unsubTransactions = onSnapshot(qTransactions, (snap) => {
+        setTransactions(snap.docs.map((d) => d.data() as Transaction));
+      });
+      setDbReady(true);
+    });
+
+    return () => {
+      unsubProducts?.();
+      unsubStudents?.();
+      unsubTransactions?.();
+    };
+  }, []);
 
   // --- Cart State ---
   const [cart, setCart] = useState<CartItem[]>([]);
@@ -510,7 +529,7 @@ export default function App() {
   };
 
   // Execute Payment
-  const handleConfirmPayment = () => {
+  const handleConfirmPayment = async () => {
     const trimmedName = customerName.trim();
     if (!trimmedName) return;
 
@@ -616,9 +635,21 @@ export default function App() {
         return prod;
       })
     );
-
-    // Save transaction to database
-    setTransactions(prev => [newTx, ...prev]);
+    await Promise.all(cart.map(item => {
+      const inCart = cart.find(c => c.product.id === item.product.id);
+      if (inCart) {
+        const updatedStock = Math.max(0, item.product.stock - inCart.quantity);
+        return fsUpdateProduct({ ...item.product, stock: updatedStock });
+      }
+      return Promise.resolve();
+    }));
+    if (paymentMethod === 'saved_money' && matchedStudent) {
+      const updatedStudent = students.find(s => s.id === matchedStudent!.id);
+      if (updatedStudent) {
+        await fsUpdateStudent(updatedStudent);
+      }
+    }
+    await fsAddTransaction(newTx);
 
     // Close payment modal, show success receipt modal, clear cart
     setIsPaymentModalOpen(false);
@@ -628,30 +659,24 @@ export default function App() {
   };
 
   // Product CRUD
-  const handleSaveProduct = (e: React.FormEvent) => {
+  const handleSaveProduct = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!productFormData.name?.trim()) return;
 
     if (viewProduct && isEditProductModalOpen) {
-      // Editing existing product
-      setProducts(prev =>
-        prev.map(p =>
-          p.id === viewProduct.id
-            ? {
-                ...p,
-                name: productFormData.name || p.name,
-                category: productFormData.category || p.category,
-                price: Number(productFormData.price) || 0,
-                stock: Number(productFormData.stock) || 0,
-                unit: productFormData.unit || p.unit
-              }
-            : p
-        )
-      );
+      const updated: Product = {
+        ...viewProduct,
+        name: productFormData.name || viewProduct.name,
+        category: productFormData.category || viewProduct.category,
+        price: Number(productFormData.price) || 0,
+        stock: Number(productFormData.stock) || 0,
+        unit: productFormData.unit || viewProduct.unit
+      };
+      setProducts(prev => prev.map(p => (p.id === updated.id ? updated : p)));
+      await fsUpdateProduct(updated);
       setIsEditProductModalOpen(false);
       setViewProduct(null);
     } else if (isAddProductModalOpen) {
-      // Adding new product
       const newProd: Product = {
         id: `prod-${Date.now()}`,
         name: productFormData.name.trim(),
@@ -661,15 +686,15 @@ export default function App() {
         unit: productFormData.unit?.trim() || 'pcs'
       };
       setProducts(prev => [newProd, ...prev]);
+      await fsUpdateProduct(newProd);
       setIsAddProductModalOpen(false);
     }
   };
 
-  const handleDeleteProduct = (productId: string) => {
+  const handleDeleteProduct = async (productId: string) => {
     const updated = products.filter(p => p.id !== productId);
     setProducts(updated);
-    storageHelper.set(STORAGE_KEYS.INVENTORY, updated);
-    // also remove from cart if present
+    await fsDeleteProduct(productId);
     setCart(prev => prev.filter(item => item.product.id !== productId));
     setIsDeleteProductModalOpen(false);
     setViewProduct(null);
@@ -688,17 +713,17 @@ export default function App() {
   };
 
   // Eksekusi penghapusan transaksi setelah dikonfirmasi oleh user
-  const confirmDeleteTransaction = () => {
+  const confirmDeleteTransaction = async () => {
     if (!transactionToDelete) return;
     const targetId = transactionToDelete.id;
     const updated = transactions.filter(t => t.id !== targetId);
     setTransactions(updated);
-    storageHelper.set(STORAGE_KEYS.TRANSACTIONS, updated);
+    await fsDeleteTransaction(targetId);
     if (selectedTxDetail?.id === targetId) {
       setSelectedTxDetail(null);
     }
     setTransactionToDelete(null);
-    showToast(`Riwayat transaksi ${targetId} berhasil dihapus dari database & storage.`);
+    showToast(`Riwayat transaksi ${targetId} berhasil dihapus dari database.`);
   };
 
   // Membuka modal konfirmasi hapus akun santri/tabungan
@@ -713,13 +738,13 @@ export default function App() {
   };
 
   // Eksekusi penghapusan data tabungan santri setelah dikonfirmasi oleh user
-  const confirmDeleteStudent = () => {
+  const confirmDeleteStudent = async () => {
     if (!studentToDelete) return;
     const targetId = studentToDelete.id;
     const targetName = studentToDelete.fullName;
     const updated = students.filter(s => s.id !== targetId);
     setStudents(updated);
-    storageHelper.set(STORAGE_KEYS.STUDENTS, updated);
+    await fsDeleteStudent(targetId);
     if (viewStudent?.id === targetId) {
       setViewStudent(null);
     }
@@ -728,7 +753,7 @@ export default function App() {
   };
 
   // Student Deposit / Add
-  const handleSaveDepositOrStudent = (e: React.FormEvent) => {
+  const handleSaveDepositOrStudent = async (e: React.FormEvent) => {
     e.preventDefault();
     const name = depositFormData.fullName.trim();
     if (!name) return;
@@ -752,31 +777,25 @@ export default function App() {
     const existingIndex = students.findIndex(s => s.fullName.toLowerCase() === name.toLowerCase());
 
     if (existingIndex >= 0) {
-      // Top-up existing student
-      setStudents(prev =>
-        prev.map((s, idx) => {
-          if (idx === existingIndex) {
-            const newBal = s.balance + amount;
-            const newLog: StudentLog = {
-              id: `log-${Date.now()}`,
-              date: displayDate,
-              type: 'deposit',
-              amount,
-              description: depositFormData.note.trim() || 'Deposit Tabungan',
-              balanceAfter: newBal
-            };
-            return {
-              ...s,
-              balance: newBal,
-              lastUpdated: displayDate,
-              history: [newLog, ...s.history]
-            };
-          }
-          return s;
-        })
-      );
+      const updated: Student = {
+        ...students[existingIndex],
+        balance: students[existingIndex].balance + amount,
+        lastUpdated: displayDate,
+        history: [
+          {
+            id: `log-${Date.now()}`,
+            date: displayDate,
+            type: 'deposit' as const,
+            amount,
+            description: depositFormData.note.trim() || 'Deposit Tabungan',
+            balanceAfter: students[existingIndex].balance + amount
+          },
+          ...students[existingIndex].history
+        ]
+      };
+      setStudents(prev => prev.map((s, idx) => (idx === existingIndex ? updated : s)));
+      await fsUpdateStudent(updated);
     } else {
-      // Register new student
       const newStudent: Student = {
         id: `std-${Date.now()}`,
         fullName: name,
@@ -787,7 +806,7 @@ export default function App() {
           {
             id: `log-${Date.now()}`,
             date: displayDate,
-            type: 'deposit',
+            type: 'deposit' as const,
             amount,
             description: depositFormData.note.trim() || 'Pendaftaran Tabungan Awal',
             balanceAfter: amount
@@ -795,6 +814,7 @@ export default function App() {
         ]
       };
       setStudents(prev => [newStudent, ...prev]);
+      await fsUpdateStudent(newStudent);
     }
 
     setIsAddDepositModalOpen(false);
@@ -806,6 +826,30 @@ export default function App() {
       note: 'Setoran Tambahan Tabungan'
     });
   };
+
+  const fsUpdateProduct = useCallback(async (product: Product) => {
+    await setDoc(doc(db, 'products', product.id), product);
+  }, []);
+
+  const fsDeleteProduct = useCallback(async (productId: string) => {
+    await deleteDoc(doc(db, 'products', productId));
+  }, []);
+
+  const fsUpdateStudent = useCallback(async (student: Student) => {
+    await setDoc(doc(db, 'students', student.id), student);
+  }, []);
+
+  const fsDeleteStudent = useCallback(async (studentId: string) => {
+    await deleteDoc(doc(db, 'students', studentId));
+  }, []);
+
+  const fsAddTransaction = useCallback(async (transaction: Transaction) => {
+    await setDoc(doc(db, 'transactions', transaction.id), transaction);
+  }, []);
+
+  const fsDeleteTransaction = useCallback(async (transactionId: string) => {
+    await deleteDoc(doc(db, 'transactions', transactionId));
+  }, []);
 
   // Filtered products for Dashboard
   const filteredProducts = useMemo(() => {
@@ -836,6 +880,121 @@ export default function App() {
       return matchSearch && matchMethod && matchDate;
     });
   }, [transactions, dbSearch, dbMethodFilter, dbDateFilter]);
+
+  const [authMode, setAuthMode] = useState<'login' | 'register'>('login');
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [authError, setAuthError] = useState('');
+  const [authSubmitting, setAuthSubmitting] = useState(false);
+
+  const handleAuth = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthError('');
+    setAuthSubmitting(true);
+    try {
+      if (authMode === 'login') {
+        await signInWithEmailAndPassword(auth, authEmail, authPassword);
+      } else {
+        await createUserWithEmailAndPassword(auth, authEmail, authPassword);
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Authentication failed';
+      setAuthError(msg.replace('Firebase: ', ''));
+    } finally {
+      setAuthSubmitting(false);
+    }
+  };
+
+  const handleLogout = async () => {
+    await signOut(auth);
+  };
+
+  if (authLoading) {
+    return (
+      <div className="min-h-screen bg-[#F7F8F0] flex items-center justify-center">
+        <div className="text-center">
+          <div className="w-12 h-12 border-4 border-[#7AAACE] border-t-transparent rounded-full animate-spin mx-auto mb-4" />
+          <p className="text-sm text-slate-500">Memuat...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!user) {
+    return (
+      <div className="min-h-screen bg-[#F7F8F0] flex items-center justify-center p-4">
+        <div className="bg-white rounded-2xl shadow-xl border border-slate-200 p-8 max-w-md w-full">
+          <div className="text-center mb-6">
+            <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-[#7AAACE] to-[#355872] p-3 flex items-center justify-center mx-auto mb-3 border border-white/20">
+              <Store className="w-8 h-8 text-[#F7F8F0]" />
+            </div>
+            <h2 className="text-xl font-bold text-[#355872]">Kantin Ma'had MBTI</h2>
+            <p className="text-xs text-slate-500 mt-1">Masuk untuk mengelola data kantin</p>
+          </div>
+
+          <form onSubmit={handleAuth} className="space-y-4">
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 mb-1">Email</label>
+              <input
+                type="email"
+                required
+                value={authEmail}
+                onChange={(e) => setAuthEmail(e.target.value)}
+                placeholder="email@example.com"
+                className="w-full px-3.5 py-2.5 text-sm bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#7AAACE]"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 mb-1">Password</label>
+              <input
+                type="password"
+                required
+                value={authPassword}
+                onChange={(e) => setAuthPassword(e.target.value)}
+                placeholder="••••••••"
+                className="w-full px-3.5 py-2.5 text-sm bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#7AAACE]"
+              />
+            </div>
+
+            {authError && (
+              <div className="p-2.5 bg-rose-50 border border-rose-200 rounded-lg text-xs text-rose-700">
+                {authError}
+              </div>
+            )}
+
+            <button
+              type="submit"
+              disabled={authSubmitting}
+              className="w-full py-2.5 px-4 rounded-lg bg-[#355872] hover:bg-[#284357] text-white text-sm font-semibold disabled:opacity-50 cursor-pointer transition-colors"
+            >
+              {authSubmitting ? 'Memproses...' : authMode === 'login' ? 'Masuk' : 'Daftar'}
+            </button>
+          </form>
+
+          <div className="mt-4 text-center">
+            <button
+              type="button"
+              onClick={() => { setAuthMode(authMode === 'login' ? 'register' : 'login'); setAuthError(''); }}
+              className="text-xs text-[#355872] font-semibold hover:underline cursor-pointer"
+            >
+              {authMode === 'login' ? 'Belum punya akun? Daftar' : 'Sudah punya akun? Masuk'}
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (!dbReady) {
+    return (
+      <div className="min-h-screen bg-[#F7F8F0] flex items-center justify-center">
+        <div className="text-center">
+          <div className="w-12 h-12 border-4 border-[#7AAACE] border-t-transparent rounded-full animate-spin mx-auto mb-4" />
+          <p className="text-sm text-slate-500">Menghubungkan ke database...</p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-[#F7F8F0] text-slate-800 flex flex-col font-sans w-full max-w-full overflow-x-hidden">
@@ -884,6 +1043,15 @@ export default function App() {
             </div>
 
             {/* Desktop Navigation Tabs (Tampil di layar desktop >= 1024px dengan teks adaptif) */}
+            <div className="hidden lg:flex items-center gap-2 shrink-0">
+              <span className="text-xs text-[#9CD5FF] truncate max-w-[120px]">{user.email}</span>
+              <button
+                onClick={handleLogout}
+                className="px-3 py-1.5 rounded-lg text-xs font-medium text-white/80 hover:bg-white/10 hover:text-white transition-colors cursor-pointer"
+              >
+                Keluar
+              </button>
+            </div>
             <nav className="hidden lg:flex items-center gap-1 xl:gap-2 shrink-0">
               <button
                 onClick={() => setActiveTab('dashboard')}
