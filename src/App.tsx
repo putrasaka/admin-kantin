@@ -16,6 +16,7 @@ import {
   type User as FirebaseUser,
 } from './firebase';
 import { migrateLocalStorageToFirestore } from './migration';
+import { buildSalesReportText, buildSalesReportHtml, formatReportDateLabel } from './report';
 import {
   Store,
   Package,
@@ -421,6 +422,37 @@ export default function App() {
   const [dbMethodFilter, setDbMethodFilter] = useState<'all' | 'cash' | 'saved_money'>('all');
   const [dbDateFilter, setDbDateFilter] = useState<string>('all');
   const [selectedTxDetail, setSelectedTxDetail] = useState<Transaction | null>(null);
+
+  // Sales Report (Laporan PDF)
+  const [reportDate, setReportDate] = useState<string>(() => new Date().toISOString().slice(0, 10));
+  const [isReportModalOpen, setIsReportModalOpen] = useState(false);
+
+  const reportTransactions = useMemo(() => {
+    return transactions
+      .filter(t => t.date.slice(0, 10) === reportDate)
+      .sort((a, b) => a.date.localeCompare(b.date));
+  }, [transactions, reportDate]);
+
+  const reportText = useMemo(() => {
+    return buildSalesReportText(reportTransactions, formatReportDateLabel(reportDate));
+  }, [reportTransactions, reportDate]);
+
+  const handlePrintReport = () => {
+    if (reportTransactions.length === 0) {
+      showToast('Tidak ada transaksi pada tanggal tersebut.');
+      return;
+    }
+    const html = buildSalesReportHtml(reportTransactions, formatReportDateLabel(reportDate));
+    const win = window.open('', '_blank', 'width=800,height=600');
+    if (!win) {
+      showToast('Popup diblokir! Izinkan popup untuk mencetak laporan.');
+      return;
+    }
+    win.document.write(html);
+    win.document.close();
+    win.focus();
+    win.print();
+  };
 
   // In-app Delete Confirmation Modals (menggantikan window.confirm yang terblokir di sandbox iframe)
   const [transactionToDelete, setTransactionToDelete] = useState<Transaction | null>(null);
@@ -1976,6 +2008,59 @@ export default function App() {
               </div>
             </div>
 
+            {/* Sales Report Bar */}
+            <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-xs flex flex-col sm:flex-row gap-3 items-stretch sm:items-center justify-between">
+              <div>
+                <h3 className="font-bold text-sm text-[#355872]">Laporan Penjualan (PDF)</h3>
+                <p className="text-xs text-slate-500">
+                  {reportTransactions.length} transaksi pada {formatReportDateLabel(reportDate)}
+                </p>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2">
+                <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-lg text-xs">
+                  <button
+                    onClick={() => setReportDate(new Date().toISOString().slice(0, 10))}
+                    className="px-2.5 py-1 rounded font-medium text-slate-600 hover:bg-slate-200 cursor-pointer"
+                  >
+                    Hari Ini
+                  </button>
+                  <button
+                    onClick={() => {
+                      const d = new Date();
+                      d.setDate(d.getDate() - 1);
+                      setReportDate(d.toISOString().slice(0, 10));
+                    }}
+                    className="px-2.5 py-1 rounded font-medium text-slate-600 hover:bg-slate-200 cursor-pointer"
+                  >
+                    Kemarin
+                  </button>
+                </div>
+
+                <input
+                  type="date"
+                  value={reportDate}
+                  onChange={e => setReportDate(e.target.value)}
+                  className="text-xs bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-slate-700 focus:outline-none focus:ring-2 focus:ring-[#7AAACE]"
+                />
+
+                <button
+                  onClick={() => setIsReportModalOpen(true)}
+                  className="py-2 px-3.5 rounded-lg bg-white border border-slate-300 hover:bg-slate-100 text-slate-700 text-xs font-semibold flex items-center gap-1.5 cursor-pointer"
+                >
+                  <Printer className="w-3.5 h-3.5" />
+                  Preview
+                </button>
+                <button
+                  onClick={handlePrintReport}
+                  className="py-2 px-3.5 rounded-lg bg-[#355872] hover:bg-[#284357] text-white text-xs font-semibold flex items-center gap-1.5 cursor-pointer shadow-xs"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  Cetak PDF
+                </button>
+              </div>
+            </div>
+
             {/* Transactions Container */}
             <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
               {/* Desktop & Tablet Table View */}
@@ -3358,6 +3443,50 @@ export default function App() {
                   Tutup
                 </button>
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 10. SALES REPORT PREVIEW MODAL */}
+      {isReportModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-xs">
+          <div className="bg-white rounded-2xl max-w-lg w-full shadow-2xl border border-slate-200 overflow-hidden">
+            <div className="bg-[#355872] p-4 text-white flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Receipt className="w-5 h-5 text-[#9CD5FF]" />
+                <h3 className="font-bold text-base">Preview Laporan {formatReportDateLabel(reportDate)}</h3>
+              </div>
+              <button onClick={() => setIsReportModalOpen(false)} className="text-white/80 hover:text-white cursor-pointer">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-4 sm:p-5 max-h-[65vh] overflow-y-auto">
+              <pre className="text-xs font-mono whitespace-pre-wrap bg-slate-50 border border-slate-200 rounded-xl p-4 text-slate-800">
+                {reportText}
+              </pre>
+            </div>
+
+            <div className="p-4 bg-slate-50 border-t border-slate-200 flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setIsReportModalOpen(false)}
+                className="px-4 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-200 rounded-lg cursor-pointer"
+              >
+                Tutup
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setIsReportModalOpen(false);
+                  handlePrintReport();
+                }}
+                className="px-4 py-2 text-xs font-semibold text-white bg-[#355872] hover:bg-[#284357] rounded-lg cursor-pointer flex items-center gap-1.5"
+              >
+                <Printer className="w-3.5 h-3.5" />
+                Cetak / Simpan PDF
+              </button>
             </div>
           </div>
         </div>
