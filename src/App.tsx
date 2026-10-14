@@ -334,33 +334,47 @@ export default function App() {
   const [dbReady, setDbReady] = useState(false);
 
   useEffect(() => {
+    if (!user) {
+      setDbReady(false);
+      return;
+    }
     let unsubProducts: (() => void) | undefined;
     let unsubStudents: (() => void) | undefined;
     let unsubTransactions: (() => void) | undefined;
+    let cancelled = false;
 
-    migrateLocalStorageToFirestore().then(() => {
-      const qProducts = query(collection(db, 'products'));
-      const qStudents = query(collection(db, 'students'));
-      const qTransactions = query(collection(db, 'transactions'), orderBy('date', 'desc'));
+    migrateLocalStorageToFirestore()
+      .catch((err) => {
+        console.error('[Migration] Gagal migrasi ke Firestore:', err);
+      })
+      .then(() => {
+        if (cancelled) return;
+        const qProducts = query(collection(db, 'products'));
+        const qStudents = query(collection(db, 'students'));
+        const qTransactions = query(collection(db, 'transactions'), orderBy('date', 'desc'));
 
-      unsubProducts = onSnapshot(qProducts, (snap) => {
-        setProducts(snap.docs.map((d) => d.data() as Product));
+        const onErr = (err: unknown) => {
+          console.error('[Firestore] Listener error:', err);
+        };
+        unsubProducts = onSnapshot(qProducts, (snap) => {
+          setProducts(snap.docs.map((d) => d.data() as Product));
+        }, onErr);
+        unsubStudents = onSnapshot(qStudents, (snap) => {
+          setStudents(snap.docs.map((d) => d.data() as Student));
+        }, onErr);
+        unsubTransactions = onSnapshot(qTransactions, (snap) => {
+          setTransactions(snap.docs.map((d) => d.data() as Transaction));
+        }, onErr);
+        setDbReady(true);
       });
-      unsubStudents = onSnapshot(qStudents, (snap) => {
-        setStudents(snap.docs.map((d) => d.data() as Student));
-      });
-      unsubTransactions = onSnapshot(qTransactions, (snap) => {
-        setTransactions(snap.docs.map((d) => d.data() as Transaction));
-      });
-      setDbReady(true);
-    });
 
     return () => {
+      cancelled = true;
       unsubProducts?.();
       unsubStudents?.();
       unsubTransactions?.();
     };
-  }, []);
+  }, [user]);
 
   // --- Cart State ---
   const [cart, setCart] = useState<CartItem[]>([]);
